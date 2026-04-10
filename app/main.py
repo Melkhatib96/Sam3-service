@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
         "Starting %s v%s  [%s]", settings.APP_NAME, settings.APP_VERSION, settings.ENVIRONMENT
     )
     logger.info("Model path : %s", settings.MODEL_LOCAL_PATH)
-    logger.info("S3 bucket  : %s  key: %s", settings.S3_BUCKET, settings.S3_MODEL_KEY)
+    logger.info("S3 bucket  : %s  key: %s", settings.AWS_S3_BUCKET_NAME, settings.S3_MODEL_KEY)
 
     segmenter = None
     watchdog_task = None

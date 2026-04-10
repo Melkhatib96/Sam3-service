@@ -73,24 +73,24 @@ def download_model_from_s3() -> None:
     local_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(
         "Downloading model from s3://%s/%s → %s …",
-        settings.S3_BUCKET, settings.S3_MODEL_KEY, local_path,
+        settings.AWS_S3_BUCKET_NAME, settings.S3_MODEL_KEY, local_path,
     )
 
     s3 = boto3.client(
         "s3",
-        endpoint_url=settings.S3_ENDPOINT_URL,
-        aws_access_key_id=settings.S3_ACCESS_KEY,
-        aws_secret_access_key=settings.S3_SECRET_KEY,
-        region_name=settings.S3_REGION,
+        endpoint_url=settings.AWS_ENDPOINT_URL,
+        aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+        region_name=settings.AWS_DEFAULT_REGION,
     )
 
     try:
-        meta = s3.head_object(Bucket=settings.S3_BUCKET, Key=settings.S3_MODEL_KEY)
+        meta = s3.head_object(Bucket=settings.AWS_S3_BUCKET_NAME, Key=settings.S3_MODEL_KEY)
         total_bytes = meta["ContentLength"]
         logger.info("Model size: %.1f MB", total_bytes / 1024 / 1024)
     except (BotoCoreError, ClientError) as exc:
         raise RuntimeError(
-            f"Cannot access model in S3 bucket '{settings.S3_BUCKET}': {exc}"
+            f"Cannot access model in S3 bucket '{settings.AWS_S3_BUCKET_NAME}': {exc}"
         ) from exc
 
     chunk_size = 64 * 1024 * 1024  # 64 MB
@@ -98,7 +98,7 @@ def download_model_from_s3() -> None:
     tmp_path = local_path.with_suffix(".tmp")
 
     try:
-        response = s3.get_object(Bucket=settings.S3_BUCKET, Key=settings.S3_MODEL_KEY)
+        response = s3.get_object(Bucket=settings.AWS_S3_BUCKET_NAME, Key=settings.S3_MODEL_KEY)
         body = response["Body"]
 
         with open(tmp_path, "wb") as fh:

@@ -27,11 +27,11 @@ class Settings(BaseSettings):
     CORS_ALLOW_HEADERS: str = "*"
 
     # ── Model / S3 bucket ─────────────────────────────────────
-    S3_ENDPOINT_URL: str  # required - e.g. https://t3.storageapi.dev
-    S3_BUCKET: str        # required - e.g. indexed-stashbox-ehdhwgm7
-    S3_REGION: str = "us-east-1"
-    S3_ACCESS_KEY: str    # required
-    S3_SECRET_KEY: str    # required
+    AWS_ENDPOINT_URL: str       # required - e.g. https://t3.storageapi.dev
+    AWS_S3_BUCKET_NAME: str     # required - e.g. indexed-stashbox-ehdhwgm7
+    AWS_DEFAULT_REGION: str = "auto"
+    AWS_ACCESS_KEY_ID: str      # required
+    AWS_SECRET_ACCESS_KEY: str  # required
     S3_MODEL_KEY: str = "models/sam3.pt"
 
     # Local path where the model is cached after download from S3
