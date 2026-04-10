@@ -201,6 +201,18 @@ class SAM3Segmenter:
         except Exception:
             pass
         gc.collect()
+
+        # Force the C allocator to return free pages to the OS.
+        # gc.collect() removes Python references but PyTorch's CPU memory
+        # allocator holds onto pages in its own pool — malloc_trim flushes them.
+        # This is a no-op on non-Linux platforms (Windows/macOS).
+        try:
+            import ctypes  # noqa: PLC0415
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            logger.info("malloc_trim called — free pages returned to OS.")
+        except Exception:
+            pass
+
         logger.info("SAM3 unloaded.")
 
     # ── Inference ─────────────────────────────────────────────────────────────
