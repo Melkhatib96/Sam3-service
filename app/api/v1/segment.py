@@ -7,7 +7,6 @@ POST /api/v1/segment
 """
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import logging
@@ -138,12 +137,9 @@ async def segment_image(
 
     try:
         segmenter = get_segmenter()
-        # segment() is CPU-bound and may trigger a disk reload after an idle-unload.
-        # Run it in a thread-pool executor so the event loop stays responsive.
-        loop = asyncio.get_event_loop()
-        raw_detections = await loop.run_in_executor(
-            None, segmenter.segment, image, classes
-        )
+        # segment() is async: it enqueues the job to the single worker thread
+        # and suspends (zero CPU) until the worker resolves the future.
+        raw_detections = await segmenter.segment(image, classes)
     except RuntimeError as exc:
         logger.error("Model inference error: %s", exc)
         raise HTTPException(

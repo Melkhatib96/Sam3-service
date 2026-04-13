@@ -55,10 +55,9 @@ async def _model_watchdog(segmenter: SAM3Segmenter) -> None:
                     "SAM3 model has been idle for %.1f min — unloading from RAM.",
                     (SAM3Segmenter.IDLE_TIMEOUT_SECONDS) / 60,
                 )
-                # unload() is fast (just sets None + gc), but run in executor
-                # to avoid any GC hiccup blocking the event loop.
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, segmenter.unload)
+                # unload() enqueues a sentinel to the worker thread — instant,
+                # no blocking, no executor needed.
+                segmenter.unload()
 
     except asyncio.CancelledError:
         logger.info("Model watchdog stopped.")
@@ -100,6 +99,9 @@ async def lifespan(app: FastAPI):
             await watchdog_task
         except asyncio.CancelledError:
             pass
+
+    if segmenter is not None:
+        segmenter.stop()  # send stop sentinel; worker thread exits cleanly
 
     logger.info("Shutting down %s", settings.APP_NAME)
 

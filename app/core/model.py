@@ -5,28 +5,32 @@ Download flow (once at startup):
   1. Check if MODEL_LOCAL_PATH already exists (cached from a previous run).
   2. If not, stream-download from the Railway S3 bucket using boto3.
 
-Inference:
-  Uses SAM3SemanticPredictor — the correct ultralytics interface for
-  text-prompted concept segmentation introduced in ultralytics 8.3.237.
+Inference — single worker thread design:
+  A single dedicated thread owns the predictor for its entire lifetime.
+  Async requests submit jobs to a queue and `await` an asyncio.Future for
+  the result.  While waiting, the coroutine is suspended (zero CPU usage),
+  so PyTorch's internal BLAS thread pool keeps all vCPUs for itself.
+
+  Under the old threading.Lock design, N concurrent requests spawned N
+  executor threads that all competed with PyTorch's BLAS threads for the
+  same vCPUs, making each inference 5-10× slower under concurrency.
 
   Call flow per request:
-    predictor.set_image(image)       # encodes image features
-    results = predictor(text=classes) # runs detector head with text prompts
-
-  Because SAM3SemanticPredictor stores image state internally, the lock is
-  held for the ENTIRE set_image → predict cycle so concurrent requests are
-  serialised.  This is appropriate: at 3.3 GB the model cannot run two
-  inferences in parallel on a memory-constrained host anyway.
+    predictor.set_image(image)        # encodes image features (ViT forward)
+    results = predictor(text=classes) # runs detector head + mask decoder
 
 Spooling / idle-unload:
   After IDLE_TIMEOUT_SECONDS (default 30 min) of no inference the watchdog
-  (started by main.py) calls unload(), freeing RAM.  The next segment()
-  call reloads from the local disk file — no S3 round-trip.
+  (started by main.py) calls unload(), which enqueues an unload sentinel.
+  The worker thread processes it and frees RAM.  The next segment() call
+  re-enqueues a load + inference job — no S3 round-trip.
 """
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
+import queue as _queue
 import threading
 import time
 from dataclasses import dataclass
@@ -53,6 +57,36 @@ class Detection:
     confidence: float
     bbox: List[float]           # [x1, y1, x2, y2] in pixels
     mask_area: Optional[int] = None  # pixel count of the segmentation mask
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker-thread helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Sentinel objects placed on the queue to signal control actions.
+_STOP   = object()  # shut down the worker thread
+_UNLOAD = object()  # unload the model from RAM
+
+
+@dataclass
+class _Job:
+    """An inference job submitted by an async request to the worker thread."""
+    image:   Image.Image
+    classes: List[str]
+    loop:    asyncio.AbstractEventLoop
+    future:  "asyncio.Future[List[Detection]]"
+
+
+def _resolve(future: asyncio.Future, result: object) -> None:
+    """Set result on a Future that may already be cancelled — safe no-op."""
+    if not future.done():
+        future.set_result(result)
+
+
+def _reject(future: asyncio.Future, exc: BaseException) -> None:
+    """Set exception on a Future that may already be cancelled — safe no-op."""
+    if not future.done():
+        future.set_exception(exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,21 +162,36 @@ def download_model_from_s3() -> None:
 
 class SAM3Segmenter:
     """
-    Wraps SAM3SemanticPredictor with a text-prompt segmentation interface
-    and built-in idle-unload / lazy-reload (spooling) support.
+    Wraps SAM3SemanticPredictor with a single-worker-thread inference queue.
 
-    SAM3SemanticPredictor is the correct ultralytics interface for SAM3's
-    Promptable Concept Segmentation (PCS) feature — it accepts a list of
-    text class names and returns all matching instances with masks and scores.
+    Architecture
+    ─────────────
+    One dedicated daemon thread (`sam3-worker`) owns the predictor object for
+    its entire lifetime.  Async callers submit _Job items to a SimpleQueue and
+    suspend on an asyncio.Future; the worker resolves each Future when
+    inference completes.
+
+    This guarantees that PyTorch's internal BLAS/OpenMP thread pool always
+    has full access to every vCPU, regardless of how many HTTP requests are
+    in flight simultaneously.
+
+    Lifecycle
+    ─────────
+    1. download_model_from_s3() / init_segmenter()  — before any requests
+    2. load()   — loads weights into RAM (called in main thread at startup)
+    3. start()  — starts the worker thread (called right after load())
+    4. [requests flow through segment()]
+    5. stop()   — sends stop sentinel; called at app shutdown
     """
 
     IDLE_TIMEOUT_SECONDS: int = 30 * 60  # 30 minutes
 
     def __init__(self, model_path: str):
         self._model_path = model_path
-        self._predictor = None   # SAM3SemanticPredictor instance
-        self._last_used: float = 0.0   # time.monotonic() timestamp
-        self._lock = threading.Lock()
+        self._predictor   = None          # SAM3SemanticPredictor; owned by worker thread
+        self._last_used: float = 0.0      # monotonic timestamp; written only by worker
+        self._queue: _queue.SimpleQueue = _queue.SimpleQueue()
+        self._worker: Optional[threading.Thread] = None
 
     # ── Public properties ─────────────────────────────────────────────────────
 
@@ -152,19 +201,99 @@ class SAM3Segmenter:
 
     @property
     def is_idle(self) -> bool:
-        return self._last_used > 0.0 and (time.monotonic() - self._last_used) >= self.IDLE_TIMEOUT_SECONDS
+        return (
+            self._last_used > 0.0
+            and (time.monotonic() - self._last_used) >= self.IDLE_TIMEOUT_SECONDS
+        )
 
-    # ── Load / unload ─────────────────────────────────────────────────────────
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Load SAM3 weights from disk into RAM. Thread-safe; no-op if already loaded."""
-        with self._lock:
-            if self._predictor is not None:
-                return
-            self._load_locked()
+        """
+        Load SAM3 weights from disk into RAM.
 
-    def _load_locked(self) -> None:
-        """Internal load — must be called while self._lock is held."""
+        Must be called BEFORE start() — runs synchronously in the calling
+        thread (no worker thread yet).  No-op if already loaded.
+        """
+        if self._predictor is None:
+            self._load()
+
+    def start(self) -> None:
+        """Start the single inference worker thread. Call once after load()."""
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._worker = threading.Thread(
+            target=self._worker_loop, daemon=True, name="sam3-worker"
+        )
+        self._worker.start()
+        logger.info("SAM3 inference worker thread started.")
+
+    def stop(self) -> None:
+        """
+        Gracefully stop the worker thread.  Blocks up to 5 s for the thread
+        to finish its current job.  Call this during app shutdown.
+        """
+        self._queue.put(_STOP)
+        if self._worker is not None:
+            self._worker.join(timeout=5)
+            self._worker = None
+
+    def unload(self) -> None:
+        """
+        Schedule a model unload via the worker thread.
+
+        Non-blocking: enqueues a sentinel and returns immediately.
+        The worker releases the predictor and calls gc / malloc_trim.
+        The next segment() call after an unload triggers automatic reload
+        from the local disk file — no S3 round-trip.
+        """
+        self._queue.put(_UNLOAD)
+
+    # ── Worker thread ─────────────────────────────────────────────────────────
+
+    def _worker_loop(self) -> None:
+        """
+        Main loop of the single inference worker thread.
+
+        Blocks on SimpleQueue.get() (zero CPU while idle) and processes
+        one job at a time:
+          • _Job      → run inference, resolve future
+          • _UNLOAD   → release predictor from RAM
+          • _STOP     → exit the loop
+        """
+        logger.info("SAM3 worker: ready for jobs.")
+        while True:
+            job = self._queue.get()  # blocks; no busy-wait
+
+            if job is _STOP:
+                logger.info("SAM3 worker: stop sentinel — exiting.")
+                break
+
+            if job is _UNLOAD:
+                if self._predictor is not None:
+                    self._do_unload()
+                continue
+
+            # Inference job
+            assert isinstance(job, _Job)
+            try:
+                if self._predictor is None:
+                    logger.info("SAM3 not in RAM — reloading from disk …")
+                    self._load()
+
+                self._last_used = time.monotonic()
+                detections = self._run_inference(self._predictor, job.image, job.classes)
+                detections.sort(key=lambda d: d.confidence, reverse=True)
+                job.loop.call_soon_threadsafe(_resolve, job.future, detections)
+
+            except Exception as exc:
+                logger.error("SAM3 worker: inference error: %s", exc, exc_info=True)
+                job.loop.call_soon_threadsafe(_reject, job.future, exc)
+
+    # ── Load / unload (called only from worker thread or during startup) ──────
+
+    def _load(self) -> None:
+        """Load SAM3 weights. Called from worker thread or main thread at startup."""
         from ultralytics.models.sam import SAM3SemanticPredictor  # noqa: PLC0415
 
         logger.info("Loading SAM3 SemanticPredictor from %s …", self._model_path)
@@ -177,23 +306,17 @@ class SAM3Segmenter:
             save=False,
         )
         self._predictor = SAM3SemanticPredictor(overrides=overrides)
-        self._last_used = time.monotonic()  # idle timer starts from load time
+        self._last_used = time.monotonic()
         logger.info("SAM3 loaded successfully.")
 
-    def unload(self) -> None:
-        """
-        Release SAM3 weights from RAM.
-        Called by the idle watchdog; the next segment() call reloads from disk.
-        """
-        with self._lock:
-            if self._predictor is None:
-                return
-            logger.info(
-                "Unloading SAM3 from RAM (idle for %.1f min).",
-                (time.monotonic() - self._last_used) / 60,
-            )
-            self._predictor = None
-            self._last_used = 0.0
+    def _do_unload(self) -> None:
+        """Release predictor from RAM. Called only from the worker thread."""
+        logger.info(
+            "Unloading SAM3 from RAM (idle for %.1f min).",
+            (time.monotonic() - self._last_used) / 60,
+        )
+        self._predictor = None
+        self._last_used = 0.0
 
         try:
             import torch  # noqa: PLC0415
@@ -204,8 +327,8 @@ class SAM3Segmenter:
 
         # Force the C allocator to return free pages to the OS.
         # gc.collect() removes Python references but PyTorch's CPU memory
-        # allocator holds onto pages in its own pool — malloc_trim flushes them.
-        # This is a no-op on non-Linux platforms (Windows/macOS).
+        # allocator holds onto pages — malloc_trim flushes them.
+        # No-op on non-Linux platforms.
         try:
             import ctypes  # noqa: PLC0415
             ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -215,35 +338,20 @@ class SAM3Segmenter:
 
         logger.info("SAM3 unloaded.")
 
-    # ── Inference ─────────────────────────────────────────────────────────────
+    # ── Public async inference API ────────────────────────────────────────────
 
-    def segment(self, image: Image.Image, classes: List[str]) -> List[Detection]:
+    async def segment(self, image: Image.Image, classes: List[str]) -> List[Detection]:
         """
-        Run text-guided concept segmentation on *image*.
+        Submit an inference job to the worker thread and await the result.
 
-        The lock is held for the FULL set_image → predict cycle because
-        SAM3SemanticPredictor stores image state internally (set_image encodes
-        image features into the predictor).  Concurrent requests are serialised;
-        this is acceptable given the model's memory footprint.
-
-        Args:
-            image:   PIL Image in RGB mode (guaranteed by _load_image in segment.py).
-            classes: Class names to find, e.g. ["car", "wheel", "window"].
-
-        Returns:
-            Detections sorted by confidence (desc), already filtered by the
-            predictor's conf threshold (set in overrides at init time).
+        The calling coroutine suspends (zero CPU) while the worker runs
+        inference.  PyTorch therefore has exclusive access to all vCPUs,
+        keeping single-request latency constant regardless of concurrency.
         """
-        with self._lock:
-            if self._predictor is None:
-                logger.info("SAM3 not in RAM — reloading from disk …")
-                self._load_locked()
-
-            self._last_used = time.monotonic()
-            detections = self._run_inference(self._predictor, image, classes)
-
-        detections.sort(key=lambda d: d.confidence, reverse=True)
-        return detections
+        loop   = asyncio.get_running_loop()
+        future: asyncio.Future[List[Detection]] = loop.create_future()
+        self._queue.put(_Job(image=image, classes=classes, loop=loop, future=future))
+        return await future
 
     # ── SAM3 inference ────────────────────────────────────────────────────────
 
@@ -263,8 +371,6 @@ class SAM3Segmenter:
         The `text` parameter takes a list of noun-phrase strings; class indices
         in the results map back to positions in that list.
         """
-        # Encode image features then run concept detection — both calls are
-        # the official SAM3SemanticPredictor API, no extra pre-processing.
         predictor.set_image(image)
         results = predictor(text=classes)
 
@@ -274,18 +380,15 @@ class SAM3Segmenter:
             if result.boxes is None or len(result.boxes) == 0:
                 continue
 
-            # names is a dict mapping cls_id → class_name string.
-            # For SAM3 text prompts, cls_id maps to the index in the `classes` list.
             names = result.names
 
             for i in range(len(result.boxes)):
-                cls_id = int(result.boxes.cls[i].item())
+                cls_id     = int(result.boxes.cls[i].item())
                 confidence = float(result.boxes.conf[i].item())
-                bbox = result.boxes.xyxy[i].cpu().numpy().tolist()
+                bbox       = result.boxes.xyxy[i].cpu().numpy().tolist()
 
-                # Resolve class name.
-                # SAM3SemanticPredictor returns names as a list (e.g. ["car", "wheel"]).
-                # Standard YOLO models return a dict ({0: "car", 1: "wheel"}).
+                # SAM3SemanticPredictor returns names as a list; standard YOLO
+                # models return a dict ({0: "car"}).  Handle both.
                 if isinstance(names, dict):
                     class_name = names.get(
                         cls_id,
@@ -293,7 +396,7 @@ class SAM3Segmenter:
                     )
                 else:  # list
                     class_name = (
-                        names[cls_id] if cls_id < len(names)
+                        names[cls_id]   if cls_id < len(names)
                         else classes[cls_id] if cls_id < len(classes)
                         else f"class_{cls_id}"
                     )
@@ -330,13 +433,16 @@ def get_segmenter() -> SAM3Segmenter:
 
 def init_segmenter() -> SAM3Segmenter:
     """
-    Download model from S3 (if not cached locally), load into RAM, register singleton.
-    Called once during app lifespan startup for warmup.
-    Subsequent reloads after idle-unload are handled transparently by segment().
+    Download model from S3 (if not cached locally), load into RAM, start the
+    worker thread, and register the singleton.
+
+    Called once during app lifespan startup.
+    Startup sequence: download → load (main thread) → start worker thread.
     """
     global _segmenter
     download_model_from_s3()
     segmenter = SAM3Segmenter(settings.MODEL_LOCAL_PATH)
-    segmenter.load()
+    segmenter.load()   # load weights synchronously before worker starts
+    segmenter.start()  # worker now owns the predictor for all future requests
     _segmenter = segmenter
     return _segmenter
